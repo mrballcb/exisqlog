@@ -1,0 +1,200 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Getopt::Long;
+use DateTime;
+
+# Set the database/server/user/pass for your installation
+my $database = 'exim';
+my $server   = 'localhost';
+my $user     = 'exim';
+my $pass     = 'eximpassword';
+my @tmp = localtime();
+my $DST = $tmp[8] ? 7 : 8;   # UTC-0700 for DST, UTC-0800 for rest (only 3 months, but hey)
+
+# Global variables
+my $mysql = "mysql -u$user -p$pass -h$server $database -e \"";
+my %opts;
+GetOptions( \%opts,
+    'date:s',
+    'day:i',
+    'days:i',
+    'from:s',
+    'id:s',
+    'individual',
+    'norbl',
+    'short|incident',
+    'test',
+    'to:s',
+    'help' => sub { &main::usage() },
+);
+
+if ( $#ARGV ge 0 ) {
+    $ARGV[0] !~ /\@/ and $opts{'id'}=$ARGV[0];
+    $ARGV[0] =~ /\@/ and $opts{'email'}=$ARGV[0];
+}
+
+if ( ! ( $opts{'id'} || $opts{'to'} || $opts{'from'} || $opts{'email'} ) ) {
+    print "Error!  Must pass the message queue id, to, or from\n";
+    exit;
+}
+
+my @tables = &availableTables();
+
+sub generateTableNames {
+    my $days = shift();
+    my $dt = DateTime->now();
+    my $duration_object = DateTime::Duration->new( days => $days );
+    $dt->subtract_duration( $duration_object );
+    my $month = $dt->month();
+    my $date = $dt->day();
+    $month = sprintf( "%02i", $month );
+    $date = sprintf( "%02i", $date );
+    return ("mailIn_" . $month . "_" . $date,
+            "mailOut_" . $month . "_" . $date);
+}
+
+sub availableTables {
+    my $cmd .= "SHOW TABLES;\"";
+    my @tables = `$mysql $cmd`;
+    chomp( @tables );
+    return @tables;
+}
+
+sub isTableAvailable {
+    my $table = shift();
+    foreach my $available ( @tables ) {
+        return 1 if ( $available =~ /\b$table\b/ );
+    }
+    return undef;
+}
+
+my @dates;
+if ( $opts{'day'} ) {
+    push @dates, $opts{'day'};
+}
+
+if ( $opts{'days'} ) {
+    foreach my $dayNum ( 0..$opts{'days'} ) {
+        push @dates, $dayNum;
+    }
+}
+
+if ( $opts{'date'} ) {
+    $opts{'date'} =~ s/[.,&_-]//g;
+    $opts{'date'} =~ s/ +/ /g;
+    $opts{'date'} =~ s/^ *//g;
+    $opts{'date'} =~ s/ *$//g;
+    $opts{'date'} = lc($opts{'date'});
+    $opts{'date'} = ucfirst($opts{'date'});
+    my $dt = DateTime->now();
+    my $duration_object = DateTime::Duration->new( days=> 1 );
+    foreach my $offset ( 0..50 ) {
+        my $dateString = $dt->month_abbr() . " " . $dt->day();
+        if ( $opts{'date'} =~ /$dateString/ ) {
+            print "Select $offset days ago\n" if ( $opts{'test'} );
+            push @dates, $offset;
+            last;
+        }
+        $dt->subtract_duration( $duration_object );
+    }
+}
+
+if ( $#dates eq -1 ) {
+    push @dates, 0;
+}
+
+foreach my $day ( @dates ) {
+    my ( $mailIn, $mailOut ) = &generateTableNames( $day );
+    if ( ! &isTableAvailable( $mailIn ) && ! &isTableAvailable( $mailOut ) ) {
+      print "Maillogs for $mailIn or $mailOut look like they've been deleted.\n";
+      next;
+    }
+    # mailDateReceived|mailHost|mailFrom|mailSize|mailInRelay|mailTo|mailDateSent|mailSendStatus
+    my $fields = $opts{short} ?
+                 "mailDateReceived,DATE_ADD(mailDateReceived,INTERVAL -$DST HOUR) AS PSTDateReceived,mailHost,mailFrom,mailSize,mailInRelay,mailTo,mailDateSent,DATE_ADD(mailDateSent,INTERVAL -$DST HOUR) AS PSTDateSent,mailOutRelay,mailSendStatus" :
+                 "t1.mailId,t1.mailqId,mailDateReceived,DATE_ADD(mailDateReceived,INTERVAL -$DST HOUR) AS PSTDateReceived,mailHost,mailFrom,mailSize,mailSPFStatus,mailSpamScore,mailSpamRules,mailSpamReport,mailReceiveStatus,mailInRelay,mailTo,mailAlias,mailForwardedTo,mailDateSent,DATE_ADD(mailDateSent,INTERVAL -$DST HOUR) AS PSTDateSent,mailRBLStatus,mailSendStatus,mailOutRelay";
+    my $cmd = "SELECT $fields FROM $mailIn AS t1 INNER JOIN $mailOut AS t2 ";
+    my $lcmd = "SELECT $fields FROM $mailIn AS t1 LEFT JOIN $mailOut AS t2 ";
+    if ( $opts{'individual'} ) {
+        $cmd = '';
+        foreach my $table ( $mailIn, $mailOut ) {
+                $cmd .= "SELECT $fields from $table WHERE ";
+                if    ( $opts{'id'} )   { $cmd .= "mailqId='" . $opts{'id'} . "' \\G "; }
+                elsif ( $opts{'to'} )   { $cmd .= "mailTo='" . $opts{'id'} . "' \\G "; }
+                elsif ( $opts{'from'} ) { $cmd .= "mailFrom='" . $opts{'id'} . "' \\G "; }
+        }
+        $cmd .= '"';
+    } elsif ( $opts{'id'} ) {
+        $opts{'id'} =~ s/:$//g;
+        $cmd = $lcmd;
+        $cmd .= "ON t1.mailqId=t2.mailqId WHERE ";
+        $cmd .= "t1.mailqId='" . $opts{'id'} . "' \\G\"";
+    } elsif ( $opts{'to'} && $opts{'from'} ) {
+        $cmd .= "ON t1.mailqId=t2.mailqId WHERE ";
+        $cmd .= $opts{'from'} =~ s/[\*\%]/%/ ?
+                "t1.mailFrom LIKE '" . $opts{'from'} . "' AND " :
+                "t1.mailFrom='" . $opts{'from'} . "' AND ";
+        $cmd .= $opts{'to'} =~ s/[\*\%]/%/g ?
+                "t2.mailTo LIKE '%" . $opts{'to'} . "%' " :
+                "t2.mailTo='" . $opts{'to'} . "' ";
+        $cmd .= $opts{'norbl'} ? "AND t1.mailReceiveStatus != 'RBL Blocked'" : '';
+        $cmd .= '\G"';
+    } elsif ( $opts{'to'} ) {
+        $cmd .= "ON t1.mailqId=t2.mailqId WHERE ";
+        $cmd .= $opts{'to'} =~ s/[\*\%]/%/g ?
+                "t2.mailTo LIKE '%" . $opts{'to'} . "%' " :
+                "t2.mailTo='" . $opts{'to'} . "' ";
+        $cmd .= $opts{'norbl'} ? "AND t1.mailReceiveStatus != 'RBL Blocked'" : '';
+        $cmd .= '\G"';
+    } elsif ( $opts{'from'} ) {
+        $cmd .= "ON t1.mailqId=t2.mailqId WHERE ";
+        $cmd .= $opts{'from'} =~ s/[\*\%]/%/ ?
+                "t1.mailFrom LIKE '" . $opts{'from'} . "' " :
+                "t1.mailFrom='" . $opts{'from'} . "' ";
+        $cmd .= $opts{'norbl'} ? "AND t1.mailReceiveStatus != 'RBL Blocked'" : '';
+        $cmd .= '\G"';
+    } elsif ( $opts{'email'} ) {
+        my $cmdorig = $cmd;
+        $cmd .= " ON t1.mailqId=t2.mailqId";
+        $cmd .= $opts{'email'} =~ s/[\*\%]/%/g ?
+                " WHERE t1.mailFrom LIKE '%" . $opts{'email'} . "%' " :
+                " WHERE t1.mailFrom='" . $opts{'email'} . "' ";
+        $cmd .= $opts{'norbl'} ? "AND t1.mailReceiveStatus != 'RBL Blocked'" : '';
+        $cmd .= " UNION ";
+        $cmd .= $cmdorig;
+        $cmd .= " ON t1.mailqId=t2.mailqId";
+        $cmd .= $opts{'email'} =~ s/[\*\%]/%/g ?
+                " WHERE t2.mailTo LIKE '%" . $opts{'email'} . "%' " :
+                " WHERE t2.mailTo='" . $opts{'email'} . "' ";
+        $cmd .= '\G"';
+    } 
+
+    # Sanitize it a little        
+    $cmd =~ s/\%\%/%/g;
+ 
+    print "\nPlease note that dates are stored in UTC, so \"PST\" times are converted to local PST8PDT timezone.\n\n";
+    print $mysql, $cmd, "\n" unless $opts{'short'};
+    print `$mysql $cmd` unless $opts{'test'};
+}
+
+sub usage {
+    my $prog = `basename $0`;
+    chomp( $prog );
+    print "\nUSAGE: $prog [options] email | mailqId\n";
+    print <<'    EOF';
+    --date    specify a syslog formatted date: "MMM DD"
+    --day     do just a single day, NUM days ago
+    --days    do the last NUM days including today
+    --from    specify just the from address
+    --id      specify just the mailqId
+    --individual  don't do join, show everything that matches
+    --norbl   skip rbl blocks in output
+    --test    test mode, prints info out while running
+    --to      specify just the to address
+    --help    this screen
+
+    EOF
+    exit;
+}

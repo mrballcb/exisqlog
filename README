@@ -1,0 +1,70 @@
+Exim SQL Log and Search
+
+Description:
+The core of this is a script which parses the exim log files fed to it and puts
+the extracted data into a mysql database.  There is also a simple web interface
+which allows you to search for that data on a per day basis (it stores the data
+in a one day per table format).  Also included is a maintenance script to age
+data out of the database by removing tables older than a configurable number of
+days.
+
+Requirements:
+1. Perl, DBI, and DBD::mysql.
+2. Mysql database
+3. Apache or whatever flavor of webserver you are familiar with.
+4. Exim must be configured with:
+   log_selector = +smtp_confirmation +return_path_on_delivery
+
+Installation:
+1. Put all of the script/* files in /usr/local/bin.  Make sure they are all
+   executable.
+2. Put this in the crontab for a user which can read the exim log files. I run
+   it under user root, but you may wish to run it using a non-privileged user.
+   On all exim mail servers:
+     */2 * * * * /usr/local/bin/cron_log2sql.sh
+3. Pick one of the servers to do a daily cleanup routine.  The crontab contents
+   on this one master server will also need to include:
+     @daily /usr/local/bin/cleansqlmainlog.pl --days=40
+4. Put the contents of www/* into your webserver directory, including the
+   .htaccess file in www/_private/.  A typical install base is /var/www/html,
+   and I typically use /var/www/html/maillog for my installation.  You may have
+   to do additional configuration to your webserver to make it access the
+   pages, but I know on a CentOS 5.x installation, it just works.
+5. I suggest at least a basic authentication setup using .htaccess to prevent
+   just anybody accessing this page, including co-workers.  In my humble
+   opinion, it should be used only on an internal webserver, but if you must put
+   it on a public facing webserver, don't leave access wide open.  Google for
+   "htaccess apache" if you do not know how to do this.
+6. Point your browser to http://yourserver/maillog and load the page.
+
+Comments:
+Exim is a very configurable system, so some parts of my configuration and
+operation may exhibit different characteristics.  For example, my system doesn't
+reject a connection using RBL's until the RCPT phase.  Why?  Because then I know
+both who it's from and who it was attempted to be delivered to, and can log both
+of them.  Also any email that's rejected before the DATA phase does not have a
+mail queue id, so I generate a fake id by combining the date, time, and server
+name.
+
+Credits:
+One of the main features of this process is the included "logtail" program.  It
+is a perl script which starts reading a logfile at the last place that it
+stopped and automatically finds the new file when it gets rotated.  Big thanks
+to Jonathan Middleton and Paul Slootman for the Logcheck package which provided
+this script.
+
+Bugs:
+I know it's not perfect, so if you find any bugs, let me know about it!  Email
+me at tlyons@ivenue.com and I'll see about fixing it up.  If it's not parsing
+your logfile properly and extracting the info you think it should, include in
+your email the logfile lines (not obfuscated, I need to see real data) and what
+you think it should be extracting.
+
+License:
+Respective components are licensed as labeled (jquery is GPL/MIT, Logcheck is
+GPL).
+My contributions are GPL v2.  See included LICENSE file for more detail.
+
+
+# vim: expandtab ts=4 tw=80
+

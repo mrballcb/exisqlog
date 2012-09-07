@@ -1,0 +1,213 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.0 Transitional//EN">
+<html>
+<head>
+  <title>Search 4.0 Webmail Sent/Received Logs</title>
+  <script type="text/javascript" src="jquery-1.2.3.min.js"></script>
+  <script type="text/javascript" src="jquery.form.js"></script>
+  <script type="text/javascript" src="jquery.getUrlParam.js"></script>
+  
+  <script type="text/javascript">
+    $(document).ready(function(){
+      var options = {
+        target: null,
+	beforeSubmit: showRequest,
+	success: showResponse
+      };
+      
+      $('#search_maillog_form').ajaxForm(options);
+
+      // Grab items from the URL
+      var submit_form = 0;
+      $("form input[type=text], form input[type=checkbox]").each(function(){
+        var value = decodeURIComponent( $(document).getUrlParam(this.name) || '' );
+        if (value == '') return true;
+        //console.log("Value of "+this.type+" named "+this.name+" is '"+value+"'");
+        switch(this.type) {
+          case 'text':
+          case 'text-area':
+            $(this).val(value);
+            submit_form++;
+            break;
+          case 'checkbox':
+          case 'radio':
+            value = (value == 0 || value == 'no' || value == 'false') ? 0 : 1;
+            this.checked = value;
+            submit_form++;
+        };
+      });
+      if ( submit_form > 0 ) {
+        $('form').submit();
+      };
+
+    });
+
+    function showRequest() {
+      $('#email_results').text("Searching...");
+      $('#email_results').removeClass('hidden');
+      return true;
+    };
+    
+    function showResponse(responseText) {
+      $('#rbl_hide_link').removeClass('hidden');
+      $('#spam_hide_link').removeClass('hidden');
+      $('#sent_hide_link').removeClass('hidden');
+      $('#local_hide_link').removeClass('hidden');
+      responseText = '<pre>' + responseText + '</pre>';
+      $('#email_results').html(responseText);
+      return false;
+    };
+    function toggleRBLvisibility() {
+      var visible = $('#rbl_visible').val();
+      if ( visible == 1 ) {
+        $('.rbl').addClass('hidden');
+        $('#rbl_visible').val(0);
+        $('#rbl_hide_link').text('Show RBLs');
+      }
+      else {
+        $('.rbl').removeClass('hidden');
+        $('#rbl_visible').val(1);
+        $('#rbl_hide_link').text('Hide RBLs');
+      }
+      return true;
+    };
+    function toggleSPAMvisibility() {
+      var visible = $('#spam_visible').val();
+      if ( visible == 1 ) {
+        $('.spam').addClass('hidden');
+        $('#spam_visible').val(0);
+        $('#spam_hide_link').text('Show Spams');
+      }
+      else {
+        $('.spam').removeClass('hidden');
+        $('#spam_visible').val(1);
+        $('#spam_hide_link').text('Hide Spams');
+      }
+      return true;
+    };
+    function toggleSENTvisibility() {
+      var visible = $('#sent_visible').val();
+      if ( visible == 1 ) {
+        $('.sent').addClass('hidden');
+        $('#sent_visible').val(0);
+        $('#sent_hide_link').text('Show Sent');
+      }
+      else {
+        $('.sent').removeClass('hidden');
+        $('#sent_visible').val(1);
+        $('#sent_hide_link').text('Hide Sent');
+      }
+      return true;
+    };
+
+    function toggleLOCALvisibility() {
+      var visible = $('#local_visible').val();
+      if ( visible == 1 ) {
+        $('.local').addClass('hidden');
+        $('#local_visible').val(0);
+        $('#local_hide_link').text('Show Local Deliveries');
+      }
+      else {
+        $('.local').removeClass('hidden');
+        $('#local_visible').val(1);
+        $('#local_hide_link').text('Hide Local Deliveries');
+      }
+      return true;
+    };
+
+    function clearFormElements(el) {
+      $(el).find(':input').each(function() {
+        switch(this.type) {
+          case 'password':
+          case 'select-multiple':
+          case 'select-one':
+          case 'text':
+          case 'text-area':
+            $(this).val('');
+            break
+          case 'checkbox':
+          case 'radio':
+            this.checked = false;
+        }
+        $('#email_results').text("");
+        $('#email_results').addClass('hidden');
+      });
+    };
+
+  </script>
+  
+  <style type="text/css">
+    #main_title {
+      text-align: center;
+    }
+    #search_maillog {
+      text-align: center;
+      background-color: #C9D9E9;
+      padding: 10px;
+    }
+    #email_results {
+      white-space: pre;
+      font-family: monospace;
+      background-color: #A9E9A9;
+      margin: 0;
+      padding: 20px;
+      white-space: pre-wrap;       /* css-3 */
+      white-space: -moz-pre-wrap;  /* Mozilla, since 1999 */
+      white-space: -pre-wrap;      /* Opera 4-6 */
+      white-space: -o-pre-wrap;    /* Opera 7 */
+      word-wrap: break-word;       /* Internet Explorer 5.5+ */
+    }
+    .hidden {
+      display: none;
+    }
+    .header {
+      background-color: #ccc;
+      padding: 1.5;
+      color: #CF3400;
+    }
+    input {
+      padding: 1px;
+    }
+    form {
+      padding: 0px;
+    }
+    
+  </style>
+</head>
+
+<body>
+  <div class='header'>
+    <h1 id='main_title' class='header'>Search 4.0 Webmail Sent/Received Logs</h1>
+  </div>
+  <div id='search_maillog'>
+  <form action='_private/maillog_search.pl' id='search_maillog_form' method='post'>
+      <input type='checkbox' name='email_long' id='email_long' />
+      <span class='heading'>Long Format&nbsp;&nbsp;</span>
+      <input type='checkbox' name='individual' id='individual' />
+      <span class='heading'>Individual&nbsp;&nbsp;</span>
+      <input type='checkbox' name='email_to' id='email_to'/>
+      <span class='heading'>To Only&nbsp;&nbsp;</span>
+      <input type='checkbox' name='email_from' id='email_from' />
+      <span class='heading'>From Only</span>
+      <br>
+      <span class='heading'>Date:</span>
+      <input type='text' name='email_date' id='email_date' />
+  
+      <span class='heading'>Email:</span>
+      <input type='text' name='email_address' id='email_address' />
+  
+      <input type='submit' name='search' value='Search' id='search_button' />
+      <input type='button' name='clear'  value='Clear Page'  id='clear_button' onclick='clearFormElements(this.form)' />
+      <input type='hidden' name='rbl_visible' value='1' id='rbl_visible' />
+      <input type='hidden' name='spam_visible' value='1' id='spam_visible' />
+      <input type='hidden' name='sent_visible' value='1' id='sent_visible' />
+      <input type='hidden' name='local_visible' value='1' id='local_visible' />
+      <br>
+      <a href='#' onclick='toggleRBLvisibility()' class='heading hidden' id='rbl_hide_link'>Hide RBLs</a>&nbsp;&nbsp;
+      <a href='#' onclick='toggleSPAMvisibility()' class='heading hidden' id='spam_hide_link'>Hide Spams</a>&nbsp;&nbsp;
+      <a href='#' onclick='toggleSENTvisibility()' class='heading hidden' id='sent_hide_link'>Hide Sent</a>&nbsp;&nbsp;
+      <a href='#' onclick='toggleLOCALvisibility()' class='heading hidden' id='local_hide_link'>Hide Local Deliveries</a>&nbsp;&nbsp;
+    </form>
+  </div>
+  <div id='email_results' class='hidden'>
+  </div>
+</body>
