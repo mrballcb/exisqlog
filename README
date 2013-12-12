@@ -8,6 +8,14 @@ in a one day per table format).  Also included is a maintenance script to age
 data out of the database by removing tables older than a configurable number of
 days.
 
+Assumptions:
+1) Database backend is mysql.  It shouldn't be too hard to convert to use your
+   favorite database with perl-DBI support.
+2) MySQL sample commands in the script are for mysql 5.0 and older.  The
+   syntax for CREATE USER and GRANT has changed for mysql 5.1 and newer.
+3) RBL hits are logged in exim.conf with:
+      message = $sender_host_address is listed at $dnslist_domain
+
 Credits:
 One of the main features of this process is the included "logtail" program.  It
 is a perl script which starts reading a logfile at the last place that it

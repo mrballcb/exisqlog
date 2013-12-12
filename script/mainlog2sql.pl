@@ -6,6 +6,7 @@ use Getopt::Long;
 use Sys::Hostname;
 use DBI;
 use Data::Dumper;
+use File::Basename;
 
 # Set the database/server/user/pass for your installation
 my $database = 'exim';
@@ -16,6 +17,7 @@ my $pass     = 'eximpassword';
 # CREATE DATABASE 'exim';
 # GRANT ALL ON exim.* TO 'exim'@'localhost' IDENTIFIED BY 'eximpassword'
 # FLUSH PRIVILEGES;
+my $mail_hostname = 'm.ivenue.com';
 
 # Global variables
 my $dbh;
@@ -26,6 +28,7 @@ $hostname =~ s/^(\w+)\..*/$1/;
 my $qhostname = &dbh->quote( $hostname );
 my ($step,$rfc_step,$spam,$rfc_2822,$spf) = (0,0,{},{});
 my $global = { mailIn => '', mailOut => '' };
+my $seen_ids;
 
 my %opts = ( 'chunk' => 10000,
 );
@@ -33,10 +36,11 @@ my %opts = ( 'chunk' => 10000,
 GetOptions( \%opts,
     'chunk|chunksize:i',
     'debug',
+    'debug2',
     'rejects',
     'test',
     'verbose',
-);
+) or usage();
 
 my $lastMonthDate='';
 my $loopcounter = $opts{chunk};
@@ -47,6 +51,21 @@ while (<STDIN>) {
         sleep 1;
         $loopcounter = $opts{chunk};
     }
+}
+
+sub usage {
+    my $cmd = basename($0);
+    print "$cmd parses maillogs from STDIN and stores results in a database\n";
+    print "\n";
+    print "Usage: $cmd [options]\n";
+    print "  chunksize  how many lines to read in at one time\n";
+    print "  debug      debugging output\n";
+    print "  debug2     extra debugging output\n";
+    print "  rejects    parse rejects file\n";
+    print "  test       test mode, no data written to database\n";
+    print "  verbose    basic status output\n";
+    print "\n";
+    exit;
 }
 
 sub dodbh {
@@ -109,12 +128,12 @@ sub createNewTable {
   `mailHost` varchar(30) default NULL,
   `mailFrom` varchar(255) default NULL,
   `mailSize` int UNSIGNED default 0,
-  `mailSPFStatus` varchar(255),
+  `mailSPFStatus` varchar(1023),
   `mailSpamScore` decimal(4,1) default 0.0,
   `mailSpamRules` varchar(1023),
-  `mailSpamReport` varchar(511),
-  `mailReceiveStatus` varchar(200),
-  `mailInRelay` varchar(100),
+  `mailSpamReport` varchar(1023),
+  `mailReceiveStatus` varchar(1023),
+  `mailInRelay` varchar(255),
   PRIMARY KEY (`mailId`),
   KEY `mailqIdx` (`mailqId`),
   KEY `fromIdx` (`mailFrom`),
@@ -174,10 +193,10 @@ sub processLine {
     }
 
     my $bad_mime_regex='(rejected during MIME ACL checks: .*)';
-    my $defer_regex='defer \(-?\d+\): (SMTP error from remote mail server after (?:initial commection|end of data|RCPT TO:\S+|MAIL FROM:\S+|pipelined DATA|DATA): host (\S+ \S+): .+)';
+    my $defer_regex='defer \(-?\d+\): (SMTP error from remote mail server after (?:initial commection|end of data|RCPT TO:\S+|MAIL FROM:\S+|pipelined DATA|DATA): host (\S+ \S+): .+|Connection timed out)';
     my $defer_maildir_regex='defer \(-?\d+\): (mailbox is full .+)';
     my $reject_regex='(SMTP error from remote mail server after (?:initial commection|end of data|RCPT TO:\S+|MAIL FROM:\S+|pipelined DATA|DATA): host (\S+ \S+): .+)';
-    my $email_regex='([^@]+\@[\S]+)';
+    my $email_regex='([^@]+\@[\S]+[^; ])';
     my $host_in3_regex='(\S+) \([\w._-]+\)( \[[\d.]+\])';
     my $host_in2_regex='\(\S+\) (\[[\d.]+\])';
     my $host_out2_regex='(\S+ \[[\d.]+\])\*?';
@@ -186,7 +205,8 @@ sub processLine {
     my $mailqid_regex='([\w-]{16})';
     my $rbl_regex='(\d+\..* is listed at .*|Blocked by internal RBL.*postmaster\.ivenue\.com.*)';
     my $size_regex='(\d+)';
-    my $spam_score_regex='scored ([\d-]+\.\d) points';
+    my $spam_regex='Warning: X-Spam-Score: ([\d-]+\.\d)\\\\n X-Spam-Report:.+-----\\\\n(.*)';
+    my $spam_score_reject_regex='scored ([\d-]+\.\d) points';
     my $rfc_2822_regex='(RFC 2822.*MUST.*)';
     my $spf_regex='SPF ((?:PASS|BLOCK|DEFER|ALLOW).+)';
 
@@ -207,9 +227,13 @@ sub processLine {
         my $relayIn =&dbh->quote( $2 . $3 );
         my $mailSize=&dbh->quote( $4 );
         my $mailSPFStatus=&getSPFStatus($mailqId);
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailSize,mailSPFStatus,mailInRelay) ";
-        $query   .=              "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$mailSize,$mailSPFStatus,$relayIn)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost => $qhostname,
+                           mailFrom => $mailFrom,
+                           mailSize => $mailSize,
+                           mailSPFStatus => $mailSPFStatus,
+                           mailInRelay => $relayIn } );
     }
     # Detect email from a host that does not reverse resolve
     elsif ( $line =~ m/^<= $email_regex H=$host_in2_regex .+ S=$size_regex/ ) {
@@ -217,9 +241,13 @@ sub processLine {
         my $relayIn =&dbh->quote( $2 );
         my $mailSize=&dbh->quote( $3 );
         my $mailSPFStatus=&getSPFStatus($mailqId);
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailSize,mailSPFStatus,mailInRelay) ";
-        $query   .=              "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$mailSize,$mailSPFStatus,$relayIn)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost => $qhostname,
+                           mailFrom => $mailFrom,
+                           mailSize => $mailSize,
+                           mailSPFStatus => $mailSPFStatus,
+                           mailInRelay => $relayIn } );
     }
     # Detect email from a host that does reverse resolve and matches who it said it was
     elsif ( $line =~ m/^<= $email_regex H=$host_in2b_regex .+ S=$size_regex/ ) {
@@ -227,9 +255,55 @@ sub processLine {
         my $relayIn =&dbh->quote( $2 );
         my $mailSize=&dbh->quote( $3 );
         my $mailSPFStatus=&getSPFStatus($mailqId);
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailSize,mailSPFStatus,mailInRelay) ";
-        $query   .=              "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$mailSize,$mailSPFStatus,$relayIn)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost => $qhostname,
+                           mailFrom => $mailFrom,
+                           mailSize => $mailSize,
+                           mailSPFStatus => $mailSPFStatus,
+                           mailInRelay => $relayIn } );
+    }
+    # Detect bounce messages variant 1
+    elsif ( $line =~ m/^<= (\<\>) H=$host_in3_regex .+ S=$size_regex/ ) {
+        my $mailFrom=&dbh->quote( "MAILER-DAEMON" );
+        my $relayIn =&dbh->quote( $2 . $3 );
+        my $mailSize=&dbh->quote( $4 );
+        my $mailSPFStatus=&getSPFStatus($mailqId);
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost => $qhostname,
+                           mailFrom => $mailFrom,
+                           mailSize => $mailSize,
+                           mailSPFStatus => $mailSPFStatus,
+                           mailInRelay => $relayIn } );
+    }
+    # Detect bounce messages variant 2
+    elsif ( $line =~ m/^<= (\<\>) H=$host_in2_regex .+ S=$size_regex/ ) {
+        my $mailFrom=&dbh->quote( "MAILER-DAEMON" );
+        my $relayIn =&dbh->quote( $2 );
+        my $mailSize=&dbh->quote( $3 );
+        my $mailSPFStatus=&getSPFStatus($mailqId);
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost => $qhostname,
+                           mailFrom => $mailFrom,
+                           mailSize => $mailSize,
+                           mailSPFStatus => $mailSPFStatus,
+                           mailInRelay => $relayIn } );
+    }
+    # Detect bounce messages variant 3
+    elsif ( $line =~ m/^<= (\<\>) H=$host_in2b_regex .+ S=$size_regex/ ) {
+        my $mailFrom=&dbh->quote( "MAILER-DAEMON" );
+        my $relayIn =&dbh->quote( $2 );
+        my $mailSize=&dbh->quote( $3 );
+        my $mailSPFStatus=&getSPFStatus($mailqId);
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost => $qhostname,
+                           mailFrom => $mailFrom,
+                           mailSize => $mailSize,
+                           mailSPFStatus => $mailSPFStatus,
+                           mailInRelay => $relayIn } );
     }
     # Detect email to a remote user (forwarded)
     elsif ( $line =~ m/^[=-]> $email_regex(?: P=<\S+>)? R=\S+ T=remote_smtp\S*.* H=$host_out2_regex .*C="(.*)"/ ) {
@@ -296,43 +370,55 @@ sub processLine {
         $query   .=               "VALUES ($mailqId,$mailTo,$qdate,$mailOutRelay,$mailSendStatus)";
         &dodbh( $query );
     }
-    # Detect SPF status of an email
-    elsif ( !$opts{'rejects'} && $line =~ m/^H=.+ $spf_regex/ ) {
-        $spf->{$mailqId} = &dbh->quote( $1 );
-        push(@{$spf->{'ids'}},$mailqId);
-        if ( scalar @{$spf->{'ids'}} > 1000 ) {
-            # Garbage collection, get rid of oldest
-            shift(@{$spf->{'ids'}});
-        }
+    # Detect spam score
+    elsif ( !$opts{'rejects'} && $line =~ m/^H=.+ $spam_regex/ ) {
+        my $mailSpamScore     = &dbh->quote( $1 );
+        (my $mailSpamReport   = $2) =~ s/\\n/\n\t/g;
+        $mailSpamReport       = &dbh->quote( "\n\t".$mailSpamReport );
+        update_or_insert($mailIn, $mailqId,
+                         { mailSpamScore => $mailSpamScore,
+                           mailSpamReport => $mailSpamReport });
     }
-    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> .+DATA:.+$spf_regex/ ) {
+    elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> .+DATA:.+$spf_regex/ ) {
         my $relayIn  =&dbh->quote( $1 . $2 );
         my $mailFrom =&dbh->quote( $3 );
         my $mailSPFStatus=&dbh->quote( $4 );
         my $mailReceiveStatus=&dbh->quote("Blocked by SPF");
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailSPFStatus });
     }
-    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> .+DATA:.+$spf_regex/ ) {
+    elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> .+DATA:.+$spf_regex/ ) {
         my $relayIn  =&dbh->quote( $1 );
         my $mailFrom =&dbh->quote( $2 );
         my $mailSPFStatus=&dbh->quote( $3 );
         my $mailReceiveStatus=&dbh->quote("Blocked by SPF");
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailSPFStatus });
     }
-    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2b_regex F=<$email_regex> .+DATA:.+$spf_regex/ ) {
+    elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in2b_regex F=<$email_regex> .+DATA:.+$spf_regex/ ) {
         my $relayIn  =&dbh->quote( $1 );
         my $mailFrom =&dbh->quote( $2 );
         my $mailSPFStatus=&dbh->quote( $3 );
         my $mailReceiveStatus=&dbh->quote("Blocked by SPF");
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailSPFStatus });
     }
-    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> rejected after DATA:.+$spam_score_regex/ ) {
+    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> rejected after DATA:.+$spam_score_reject_regex/ ) {
         my $relayIn  =&dbh->quote( $1 . $2 );
         my $mailFrom =&dbh->quote( $3 );
         my $spamScore=&dbh->quote( $4 );
@@ -340,11 +426,16 @@ sub processLine {
         my $mailSPFStatus=&getSPFStatus($mailqId);
         $step++;
         $spam->{'date'} = &dbh->quote( $date );
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailSpamScore,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$spamScore,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailSpamScore    => $spamScore,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
-    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> rejected after DATA:.+$spam_score_regex/ ) {
+    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> rejected after DATA:.+$spam_score_reject_regex/ ) {
         my $relayIn  =&dbh->quote( $1 );
         my $mailFrom =&dbh->quote( $2 );
         my $spamScore=&dbh->quote( $3 );
@@ -352,11 +443,16 @@ sub processLine {
         my $mailSPFStatus=&getSPFStatus($mailqId);
         $step++;
         $spam->{'date'} = &dbh->quote( $date );
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailSpamScore,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$spamScore,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailSpamScore    => $spamScore,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
-    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2b_regex F=<$email_regex> rejected after DATA:.+$spam_score_regex/ ) {
+    elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2b_regex F=<$email_regex> rejected after DATA:.+$spam_score_reject_regex/ ) {
         my $relayIn  =&dbh->quote( $1 );
         my $mailFrom =&dbh->quote( $2 );
         my $spamScore=&dbh->quote( $3 );
@@ -364,9 +460,14 @@ sub processLine {
         my $mailSPFStatus=&getSPFStatus($mailqId);
         $step++;
         $spam->{'date'} = &dbh->quote( $date );
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailSpamScore,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$spamScore,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailSpamScore    => $spamScore,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> rejected after DATA:.+$rfc_2822_regex/ ) {
         my $relayIn  =&dbh->quote( $1 . $2 );
@@ -376,9 +477,13 @@ sub processLine {
         $rfc_2822->{'mailSendStatus'} = $mailReceiveStatus;
         $rfc_2822->{'date'}           = &dbh->quote( $date );
         $rfc_step++;
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> rejected after DATA:.+$rfc_2822_regex/ ) {
         my $relayIn  =&dbh->quote( $1 );
@@ -389,9 +494,13 @@ sub processLine {
         $rfc_2822->{'date'}           = &dbh->quote( $date );
         $rfc_step++;
         print "2 host match, counter is $rfc_step\n" if ( $opts{'debug'} );
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( $opts{'rejects'} && $line =~ m/^H=$host_in2b_regex F=<$email_regex> rejected after DATA:.+$rfc_2822_regex/ ) {
         my $relayIn  =&dbh->quote( $1 );
@@ -401,9 +510,13 @@ sub processLine {
         $rfc_2822->{'mailSendStatus'} = $mailReceiveStatus;
         $rfc_2822->{'date'}           = &dbh->quote( $date );
         $rfc_step++;
-        my $query = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query   .=                "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> rejected RCPT <$email_regex>: $rbl_regex/ ) {
         my $relayIn=&dbh->quote( $1 );
@@ -411,12 +524,17 @@ sub processLine {
         my $mailTo=&preparedMailTo($3);
         my $mailRBLStatus=&dbh->quote( $4 );
         my $mailSPFStatus=&getSPFStatus($mailqId);
+        my $mailReceiveStatus=&dbh->quote("RBL Blocked");
         my $query = "REPLACE INTO $mailOut (mailqId,mailTo,mailDateSent,mailRBLStatus,mailSendStatus) ";
         $query   .=              "VALUES ($mailqId,$mailTo,$qdate,$mailRBLStatus,'RBL Blocked')";
         &dodbh( $query );
-        $query  = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query .=               "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,'RBL Blocked',$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in2b_regex F=<$email_regex> rejected RCPT <$email_regex>: $rbl_regex/ ) {
         my $relayIn=&dbh->quote( $1 );
@@ -424,12 +542,17 @@ sub processLine {
         my $mailTo=&preparedMailTo($3);
         my $mailRBLStatus=&dbh->quote( $4 );
         my $mailSPFStatus=&getSPFStatus($mailqId);
+        my $mailReceiveStatus=&dbh->quote("RBL Blocked");
         my $query = "REPLACE INTO $mailOut (mailqId,mailTo,mailDateSent,mailRBLStatus,mailSendStatus) ";
         $query   .=              "VALUES ($mailqId,$mailTo,$qdate,$mailRBLStatus,'RBL Blocked')";
         &dodbh( $query );
-        $query  = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query .=               "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,'RBL Blocked',$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> rejected RCPT <$email_regex>: $rbl_regex/ ) {
         my $relayIn=&dbh->quote( $1 . $2 );
@@ -437,12 +560,17 @@ sub processLine {
         my $mailTo=&preparedMailTo($4);
         my $mailRBLStatus=&dbh->quote( $5 );
         my $mailSPFStatus=&getSPFStatus($mailqId);
+        my $mailReceiveStatus=&dbh->quote("RBL Blocked");
         my $query = "REPLACE INTO $mailOut (mailqId,mailTo,mailDateSent,mailRBLStatus,mailSendStatus) ";
         $query   .=              "VALUES ($mailqId,$mailTo,$qdate,$mailRBLStatus,'RBL Blocked')";
         &dodbh( $query );
-        $query  = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query .=               "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,'RBL Blocked',$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in2_regex F=<$email_regex> $bad_mime_regex T=$email_regex/ ) {
         my $relayIn=&dbh->quote( $1 );
@@ -453,9 +581,13 @@ sub processLine {
         my $query = "REPLACE INTO $mailOut (mailqId,mailTo,mailDateSent) ";
         $query   .=              "VALUES ($mailqId,$mailTo,$qdate)";
         &dodbh( $query );
-        $query  = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query .=               "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
     elsif ( !$opts{'rejects'} && $line =~ m/^H=$host_in3_regex F=<$email_regex> $bad_mime_regex T=$email_regex/ ) {
         my $relayIn=&dbh->quote( $1 . $2 );
@@ -466,18 +598,34 @@ sub processLine {
         my $query = "REPLACE INTO $mailOut (mailqId,mailTo,mailDateSent) ";
         $query   .=              "VALUES ($mailqId,$mailTo,$qdate)";
         &dodbh( $query );
-        $query  = "REPLACE INTO $mailIn (mailqId,mailDateReceived,mailHost,mailFrom,mailInRelay,mailReceiveStatus,mailSPFStatus) ";
-        $query .=               "VALUES ($mailqId,$qdate,$qhostname,$mailFrom,$relayIn,$mailReceiveStatus,$mailSPFStatus)";
-        &dodbh( $query );
+        update_or_insert($mailIn, $mailqId,
+                         { mailDateReceived => $qdate,
+                           mailHost         => $qhostname,
+                           mailFrom         => $mailFrom,
+                           mailInRelay      => $relayIn,
+                           mailReceiveStatus => $mailReceiveStatus,
+                           mailSPFStatus    => $mailReceiveStatus });
     }
+
+    # Detect SPF status of an email
+    if ( !$opts{'rejects'} && $line =~ m/^H=.+ $spf_regex/ ) {
+        $spf->{$mailqId} = &dbh->quote( $1 );
+        push(@{$spf->{'ids'}},$mailqId);
+        if ( scalar @{$spf->{'ids'}} > 1000 ) {
+            # Garbage collection, get rid of oldest
+            shift(@{$spf->{'ids'}});
+        }
+    }
+
+    # In reject mode, assemble the sender and receiver from the raw headers
+    # logged in the reject log
     if ( $opts{'rejects'} ) {
-        # Ugly hack to extract sender and spam scores from spamassassin output in reject log
         if ( $step == 1 && $line =~ /^P Received: from (.+)/ ) { 
             $spam->{'mailInRelay'} = &dbh->quote( $1 );
             print "**** Found mailInRelay " . $spam->{'mailInRelay'} . " in step $step\n" if ( $opts{'debug'} );
             $step++;
         }
-        elsif ( $step == 2 && $line =~ /^\tby m.ivenue.com/ ) {
+        elsif ( $step == 2 && $line =~ /^\tby $mail_hostname/ ) {
             print "**** step $step detected our mail server\n" if ( $opts{'debug'} );
             $step++;
         }
@@ -518,7 +666,7 @@ sub processLine {
             &dodbh( $query );
             $query = "REPLACE INTO $mailOut (mailqId,mailDateSent,mailTo,mailSendStatus) ";
             $query .= "VALUES (" . $spam->{'mailqId'} . "," . $spam->{'date'} . "," ;
-            $query .=              $spam->{'mailFrom'} . "," . $spam->{'mailSendStatus'} . ")";
+            $query .=              $spam->{'mailTo'}  . "," . $spam->{'mailSendStatus'} . ")";
             &dodbh( $query );
             $spam = {};
             print "**** Detected end of spam report\n" if ( $opts{'debug'} );
@@ -529,7 +677,7 @@ sub processLine {
             $spam = {};
         }
         else {
-             print "NO MATCH($step): $line\n" if ( $opts{'debug'} );
+             print "NO MATCH($step): $line\n" if ( $opts{'debug2'} );
              $step = 0 if ($step > 7);
         }
 
@@ -537,7 +685,7 @@ sub processLine {
             $rfc_2822->{'mailInRelay'} = &dbh->quote( $1 );
             $rfc_step++;
         }
-        elsif ( $rfc_step == 2 && $line =~ /^\tby m.ivenue.com/ ) {
+        elsif ( $rfc_step == 2 && $line =~ /^\tby $mail_hostname/ ) {
             $rfc_step++;
         }
         elsif ( $rfc_step == 3 && $line =~ /^\t\(envelope-from <$email_regex>\)/ ) {
@@ -550,6 +698,7 @@ sub processLine {
         }
         elsif ( $rfc_step == 4 && $line =~ /^\tfor $email_regex/ ) {
             $rfc_2822->{'mailTo'} = &dbh->quote( $1 );
+            print "**** Found mailTo " . $1 . " in RFC step " . $rfc_step . "\n" if ( $opts{'debug'} );
             $rfc_step++;
         }
         elsif ( $rfc_step == 5 ) {
@@ -586,6 +735,34 @@ sub getSPFStatus {
         delete $spf->{$mailqId};
     }
     return(&dbh->quote( $val ));
+}
+
+sub update_or_insert {
+    my $table   = shift();
+    my $mailqId = shift();
+    my $data    = shift();
+    my $query;
+    # Depending where logtail starts/stops, there may already be data there, so set
+    # the stage to do updates instead of inserts.
+    $query    = "SELECT mailqId FROM $table WHERE mailqId=$mailqId";
+    my $rows  = &dbh->do($query);
+    if ($rows > 0) {
+      $seen_ids->{$table}->{$mailqId}++;
+    }
+    if (defined $seen_ids->{$table}->{$mailqId}) {
+      $query    = "UPDATE $table SET ";
+      $query   .= join ',',
+                  map "$_=$data->{$_}",
+                  keys %$data;
+      $query   .= " WHERE mailqId=$mailqId";
+    }
+    else {
+      $query    = "REPLACE INTO $table ";
+      $query   .= "(mailqId," . (join ',', keys %$data) . ") ";
+      $query   .= "VALUES ($mailqId," . (join ',', map "$data->{$_}", keys %$data) .")";
+      $seen_ids->{$table}->{$mailqId}++;
+    }
+    &dodbh( $query );
 }
 
 # vim: expandtab ts=4
